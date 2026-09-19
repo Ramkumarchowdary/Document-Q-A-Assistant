@@ -1,0 +1,9 @@
+streamlit[pdf]
+pandas
+openpyxl
+xlrd
+pdfplumber
+langchain
+langchain-google-genai
+langchain-experimental
+tabulate
