@@ -1,29 +1,23 @@
+
+
+
 """Excel Q&A Assistant - ask plain-English questions about an uploaded spreadsheet."""
 
 from __future__ import annotations
 
 import hashlib
-import os
 from io import BytesIO, StringIO
 
 import pandas as pd
 import pdfplumber
 import streamlit as st
+from fpdf import FPDF
+from langchain_anthropic import ChatAnthropic
 from langchain_experimental.agents import create_pandas_dataframe_agent
-from langchain_google_genai import ChatGoogleGenerativeAI
 
-DEFAULT_MODEL = "gemini-3.6-flash"
+MODEL_OPTIONS = ["claude-sonnet-5", "claude-opus-4-8", "claude-haiku-4-5-20251001"]
 
 st.set_page_config(page_title="Excel Q&A Assistant", layout="wide")
-
-
-def _get_api_key() -> str:
-    try:
-        if "GOOGLE_API_KEY" in st.secrets:
-            return st.secrets["GOOGLE_API_KEY"]
-    except Exception:
-        pass
-    return os.environ.get("GOOGLE_API_KEY", "")
 
 
 # ---------------------------------------------------------------------------
@@ -50,16 +44,15 @@ def _extract_pdf_tables(file_bytes: bytes) -> list[tuple[str, pd.DataFrame]]:
                     continue
                 header, *rows = raw_table
                 header = [col if col not in (None, "") else f"col_{i}" for i, col in enumerate(header)]
-                rows = [row for row in rows if any(cell not in (None, "") for cell in row)]
-                if not rows:
-                    continue
                 table_df = pd.DataFrame(rows, columns=header)
                 tables.append((f"Page {page_num} - Table {table_num}", table_df))
     return tables
 
 
 def render_sidebar():
-    st.sidebar.header("Upload your data")
+    st.sidebar.header("Settings")
+    api_key = st.sidebar.text_input("Anthropic API Key", type="password")
+    model = st.sidebar.selectbox("Model", MODEL_OPTIONS)
     uploaded_file = st.sidebar.file_uploader(
         "Upload Excel, CSV, or PDF", type=["xlsx", "xls", "csv", "pdf"]
     )
@@ -67,8 +60,6 @@ def render_sidebar():
     df = None
     sheet_name = ""
     file_hash = ""
-    file_type = None
-    file_bytes = None
 
     if uploaded_file is not None:
         file_bytes = uploaded_file.getvalue()
@@ -76,7 +67,6 @@ def render_sidebar():
         name = uploaded_file.name.lower()
         try:
             if name.endswith((".xlsx", ".xls")):
-                file_type = "excel"
                 excel_file = pd.ExcelFile(BytesIO(file_bytes))
                 sheet_names = excel_file.sheet_names
                 if len(sheet_names) > 1:
@@ -85,7 +75,6 @@ def render_sidebar():
                     sheet_name = sheet_names[0]
                 df = excel_file.parse(sheet_name)
             elif name.endswith(".pdf"):
-                file_type = "pdf"
                 tables = _extract_pdf_tables(file_bytes)
                 if not tables:
                     st.sidebar.warning(
@@ -101,13 +90,12 @@ def render_sidebar():
                     )
                     df = dict(tables)[sheet_name]
             else:
-                file_type = "csv"
                 df = pd.read_csv(BytesIO(file_bytes))
         except Exception as exc:
             st.sidebar.error(f"Could not read the uploaded file: {exc}")
             df = None
 
-    return df, sheet_name, file_hash, file_type, file_bytes
+    return api_key, model, df, sheet_name, file_hash
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +104,7 @@ def render_sidebar():
 
 @st.cache_resource(show_spinner="Setting up the assistant...")
 def get_agent(api_key: str, model: str, file_hash: str, sheet_name: str, _df: pd.DataFrame):
-    llm = ChatGoogleGenerativeAI(model=model, google_api_key=api_key, temperature=0)
+    llm = ChatAnthropic(model=model, anthropic_api_key=api_key, temperature=0)
     return create_pandas_dataframe_agent(
         llm,
         _df,
@@ -125,22 +113,6 @@ def get_agent(api_key: str, model: str, file_hash: str, sheet_name: str, _df: pd
         agent_type="tool-calling",
         return_intermediate_steps=True,
     )
-
-
-def _stringify_output(output) -> str:
-    """Some chat models (e.g. Gemini) return structured content blocks
-    instead of a plain string; flatten those down to text."""
-    if isinstance(output, str):
-        return output
-    if isinstance(output, list):
-        parts = []
-        for item in output:
-            if isinstance(item, dict) and "text" in item:
-                parts.append(str(item["text"]))
-            else:
-                parts.append(str(item))
-        return "\n".join(parts).strip()
-    return str(output)
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +161,65 @@ def extract_table(agent, intermediate_steps):
 
 
 # ---------------------------------------------------------------------------
+# Export helpers
+# ---------------------------------------------------------------------------
+
+def _safe_text(text: str) -> str:
+    return str(text).encode("latin-1", "replace").decode("latin-1")
+
+
+def build_pdf(question: str, answer: str, table: pd.DataFrame | None) -> bytes:
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.multi_cell(0, 10, "Excel Q&A Assistant", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(2)
+
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.multi_cell(0, 7, "Question", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", size=11)
+    pdf.multi_cell(0, 7, _safe_text(question), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(2)
+
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.multi_cell(0, 7, "Answer", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", size=11)
+    pdf.multi_cell(0, 7, _safe_text(answer), new_x="LMARGIN", new_y="NEXT")
+
+    if table is not None and not table.empty:
+        pdf.ln(4)
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.cell(0, 8, "Supporting data (up to 30 rows)", new_x="LMARGIN", new_y="NEXT")
+
+        subset = table.head(30)
+        columns = list(subset.columns)
+        col_width = 190 / max(len(columns), 1)
+
+        pdf.set_font("Helvetica", "B", 8)
+        for col in columns:
+            pdf.cell(col_width, 6, _safe_text(col)[:20], border=1)
+        pdf.ln()
+
+        pdf.set_font("Helvetica", size=8)
+        for _, row in subset.iterrows():
+            for value in row:
+                pdf.cell(col_width, 6, _safe_text(value)[:20], border=1)
+            pdf.ln()
+
+    return bytes(pdf.output())
+
+
+def build_excel(question: str, answer: str, table: pd.DataFrame | None) -> bytes:
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        answer_df = pd.DataFrame({"Question": [question], "Answer": [answer]})
+        answer_df.to_excel(writer, sheet_name="Answer", index=False)
+        if table is not None and not table.empty:
+            table.to_excel(writer, sheet_name="Data", index=False)
+    return buffer.getvalue()
+
+
+# ---------------------------------------------------------------------------
 # Main app
 # ---------------------------------------------------------------------------
 
@@ -196,35 +227,25 @@ def main():
     st.title("Excel Q&A Assistant")
     st.caption("Upload a spreadsheet and ask questions about it in plain English.")
 
-    api_key = _get_api_key()
-    model = DEFAULT_MODEL
-    df, sheet_name, file_hash, file_type, file_bytes = render_sidebar()
+    api_key, model, df, sheet_name, file_hash = render_sidebar()
 
-    if file_type == "pdf" and file_bytes is not None:
-        st.subheader("Data preview")
-        st.pdf(file_bytes, height=500)
-    elif df is not None:
+    if df is not None:
         st.subheader("Data preview")
         st.caption(f"Showing up to 50 of {len(df)} rows.")
         st.dataframe(df.head(50), use_container_width=True)
     else:
-        st.info("Upload an Excel, CSV, or PDF file from the sidebar to get started.")
+        st.info("Upload an Excel or CSV file from the sidebar to get started.")
 
     st.subheader("Ask a question")
-    with st.form("question_form", clear_on_submit=True):
-        question = st.text_input("Question about your data")
-        ask_clicked = st.form_submit_button("Ask")
+    question = st.text_input("Question about your data")
+    ask_clicked = st.button("Ask")
 
     if "history" not in st.session_state:
         st.session_state.history = []
 
     if ask_clicked:
         if not api_key:
-            st.error(
-                "This app isn't configured with a Google API key. "
-                "The site owner needs to set the GOOGLE_API_KEY "
-                "environment variable or Streamlit secret."
-            )
+            st.warning("Enter your Anthropic API key in the sidebar.")
         elif df is None:
             st.warning("Upload a file first.")
         elif not question.strip():
@@ -240,7 +261,7 @@ def main():
                 with st.spinner("Thinking..."):
                     try:
                         result = agent.invoke({"input": question})
-                        answer_text = _stringify_output(result.get("output", ""))
+                        answer_text = result.get("output", "")
                         steps = result.get("intermediate_steps", [])
                         try:
                             table = extract_table(agent, steps)
@@ -255,7 +276,7 @@ def main():
 
     if st.session_state.history:
         st.subheader("Chat history")
-        for entry in st.session_state.history:
+        for idx, entry in enumerate(st.session_state.history):
             with st.container(border=True):
                 st.markdown(f"**Q: {entry['question']}**")
                 st.write(entry["answer"])
@@ -263,6 +284,27 @@ def main():
                 table = entry.get("table")
                 if table is not None and not table.empty:
                     st.dataframe(table, use_container_width=True)
+
+                pdf_bytes = build_pdf(entry["question"], entry["answer"], table)
+                excel_bytes = build_excel(entry["question"], entry["answer"], table)
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.download_button(
+                        "Download as PDF",
+                        data=pdf_bytes,
+                        file_name=f"answer_{idx}.pdf",
+                        mime="application/pdf",
+                        key=f"pdf_{idx}",
+                    )
+                with col2:
+                    st.download_button(
+                        "Download as Excel",
+                        data=excel_bytes,
+                        file_name=f"answer_{idx}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"xlsx_{idx}",
+                    )
 
 
 if __name__ == "__main__":
